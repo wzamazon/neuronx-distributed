@@ -21,7 +21,7 @@ import math
 import random
 import time
 import queue
-
+import json
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -73,6 +73,7 @@ from training_utils import (
     get_sin_cos_matrix
 )
 from logger import Logger
+from datetime import datetime
 
 
 def allreduce_sequence_parallel_gradients(optimizer):
@@ -116,6 +117,10 @@ class Throughput:
             window_size -= 1
         throughput = window_size * self.seqs_per_iteration / self.window_time
         return throughput
+
+g_t0 = None  # timestamp when entry main
+g_t1 = None  # timestamp when 5th batch end
+g_t2 = None  # timestamp when 10th batch end
 
 def train_llama(args):
 
@@ -288,8 +293,15 @@ def train_llama(args):
                     use_xser=True,
                     num_kept_ckpts=args.num_kept_checkpoint,
                 )
+            if total_steps == 5:
+                g_t1 = datetime.now()
+
+            if total_steps == 10:
+                g_t2 = datetime.now()
+
             if total_steps >= args.max_steps:
                 break
+
 
         if total_steps >= args.max_steps:
             break
@@ -297,11 +309,27 @@ def train_llama(args):
 
     print("Training finished successfully")
 
+    if args.save_timing and total_steps >= 10 and torch.distributed.get_rank()==0:
+        dt1 = (g_t1 - g_t0).total_seconds()
+        dt2 = (g_t2 - g_t1).total_seconds()
+        startup_time = (dt1 - dt2)
+        metrics = {
+                "pytorch_version" : torch.__version__,
+                "with_store_based_barrier" : os.getenv("TORCH_DIST_INIT_BARRIER", "1"),
+                "total_number_of_processes" : torch.distributed.get_world_size(),
+                "startup_time_in_second" : startup_time
+            }
+
+        json_object = json.dumps(metrics, indent=4)
+        with open(args.timing_json, "w") as ofs:
+            ofs.write(json_object)
+
 def _mp_fn(index, args):
     train_llama(args)
     xm.rendezvous("_mp_fn finished")
 
 if __name__ == "__main__":
+    g_t0 = datetime.now()
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_microbatches", type=int, default=8, help="num_microbatches")
     parser.add_argument("--tensor_parallel_size", type=int, default=8, help="tensor_parallel_size")
@@ -322,6 +350,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_kept_checkpoint", type=int, default=-1, help="number of checkpoints kept, old checkpoint will get deleted")
     parser.add_argument("--save_load_xser", type=int, default=1, help="save/load with xla serialization")
     parser.add_argument("--pretrained_weight_dir", type=str, default=None, help="Load dir of pretrained weight")
+    parser.add_argument("--save_timing", action='store_true', default=False, help="whether to saving time to a json file")
+    parser.add_argument("--timing_json", type=str, default=None, help="output timing json file")
 
     # optimization
     opt_grp = parser.add_argument_group(title="optimization", description="arguments for optimization")
@@ -351,6 +381,12 @@ if __name__ == "__main__":
     # https://github.com/aws-neuron/aws-neuron-sdk/issues/593   
     if os.environ.get("XLA_USE_BF16") or os.environ.get("XLA_DOWNCAST_BF16") or args.use_amp > 0:
         modeling_utils.get_parameter_dtype = lambda x: torch.bfloat16
+
+    if args.save_timing:
+        if args.timing_json is None:
+            raise RuntimeError("Error: you asked me to write timing file, but did not provide a output file name")
+        if args.max_steps < 10:
+            raise RuntimeError("Error: to evaluate timing, max_step need to be >= 10")
 
     if os.environ.get("WORLD_SIZE"):
         dist.init_process_group("xla")
